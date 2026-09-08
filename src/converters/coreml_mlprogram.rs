@@ -5321,7 +5321,9 @@ impl CoremlMlProgramConverter {
     fn create_feature_type(
         descriptor: &crate::graph::OperandDescriptor,
     ) -> Result<crate::protos::coreml::specification::FeatureType, GraphError> {
-        use crate::protos::coreml::specification::{ArrayFeatureType, FeatureType, feature_type};
+        use crate::protos::coreml::specification::{
+            ArrayFeatureType, FeatureType, SizeRange, array_feature_type, feature_type,
+        };
 
         // Map WebNN data type to CoreML array data type
         // CoreML feature descriptions (I/O) ONLY support: DOUBLE, FLOAT32, FLOAT16, INT32
@@ -5365,6 +5367,31 @@ impl CoremlMlProgramConverter {
 
         for &dim in &shape_to_use {
             array_feature.shape.push(dim as i64);
+        }
+
+        if descriptor
+            .shape
+            .iter()
+            .any(|dim| matches!(dim, GraphDimension::Dynamic(_)))
+        {
+            let size_ranges = descriptor
+                .shape
+                .iter()
+                .map(|dim| match dim {
+                    GraphDimension::Static(size) => SizeRange {
+                        lower_bound: u64::from(*size),
+                        upper_bound: i64::from(*size),
+                    },
+                    GraphDimension::Dynamic(dynamic) => SizeRange {
+                        lower_bound: 0,
+                        upper_bound: i64::from(dynamic.max_size),
+                    },
+                })
+                .collect();
+            array_feature.shape_flexibility =
+                Some(array_feature_type::ShapeFlexibility::ShapeRange(
+                    array_feature_type::ShapeRange { size_ranges },
+                ));
         }
 
         Ok(FeatureType {
@@ -11630,6 +11657,33 @@ mod tests {
             dimension::Dimension::Constant(c) => assert_eq!(c.size, 4),
             _ => panic!("expected constant dimension for static axis"),
         }
+
+        let feature = model
+            .description
+            .as_ref()
+            .and_then(|description| description.input.first())
+            .and_then(|feature| feature.r#type.as_ref())
+            .and_then(|feature_type| feature_type.r#type.as_ref())
+            .expect("input feature type");
+        let crate::protos::coreml::specification::feature_type::Type::MultiArrayType(array) =
+            feature
+        else {
+            panic!("expected multi-array input");
+        };
+        assert_eq!(array.shape, vec![8, 4]);
+        let Some(
+            crate::protos::coreml::specification::array_feature_type::ShapeFlexibility::ShapeRange(
+                shape_range,
+            ),
+        ) = array.shape_flexibility.as_ref()
+        else {
+            panic!("expected flexible input shape range");
+        };
+        assert_eq!(shape_range.size_ranges.len(), 2);
+        assert_eq!(shape_range.size_ranges[0].lower_bound, 0);
+        assert_eq!(shape_range.size_ranges[0].upper_bound, 8);
+        assert_eq!(shape_range.size_ranges[1].lower_bound, 4);
+        assert_eq!(shape_range.size_ranges[1].upper_bound, 4);
     }
 
     #[test]

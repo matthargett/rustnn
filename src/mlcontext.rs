@@ -339,8 +339,12 @@ impl MLOperandDescriptor {
     }
 
     pub(crate) fn rustnn_required_bytes(&self) -> usize {
-        let elements = (self.shape().iter().copied().product::<u64>() as usize).max(1);
-        self.data_type().rustnn_storage_byte_length(elements).max(1)
+        let elements = if self.shape().is_empty() {
+            1
+        } else {
+            self.shape().iter().copied().product::<u64>() as usize
+        };
+        self.data_type().rustnn_storage_byte_length(elements)
     }
 }
 
@@ -627,6 +631,15 @@ impl<'context> MLContext<'context> {
 #[cfg(test)]
 mod test {
     use crate::{mlcontext::*, mlgraphbuilder::MLGraphBuilder, webnn_json::from_graph_json};
+
+    #[test]
+    fn tensor_required_bytes_distinguishes_scalar_and_zero_extent() {
+        let scalar = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![]);
+        assert_eq!(scalar.rustnn_required_bytes(), 4);
+
+        let empty = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![1, 3, 0, 64]);
+        assert_eq!(empty.rustnn_required_bytes(), 0);
+    }
 
     fn create_add_graph_context_and_graph() -> Option<(MLContext<'static>, MLGraph<'static>)> {
         let contents = r#"

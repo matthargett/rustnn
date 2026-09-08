@@ -20,6 +20,7 @@ use crate::executors::coreml::{
     CompiledCoremlModel, CoremlByteInput, compile_model, run_coreml_bytes,
 };
 use crate::graph::DataType;
+use crate::graph::Dimension;
 use crate::mlcontext::RustNNOptions;
 use crate::mlcontext::{
     MLBackendBuilder, MLBackendContext, MLBackendGraph, MLGraph, MLNamedTensors, MLTensor,
@@ -30,6 +31,28 @@ use crate::operators::Operation;
 /// Number of bytes required to store a tensor described by `descriptor`.
 fn tensor_byte_len(descriptor: &MLTensorDescriptor) -> usize {
     descriptor.rustnn_required_bytes()
+}
+
+fn runtime_input_descriptor(
+    graph_descriptor: &crate::graph::OperandDescriptor,
+    tensor: &MLTensor,
+) -> crate::error::Result<crate::graph::OperandDescriptor> {
+    let shape = tensor
+        .shape()
+        .iter()
+        .map(|&size| {
+            u32::try_from(size)
+                .map(Dimension::Static)
+                .map_err(|_| Error::GraphDispatchError {
+                    source: format!("runtime input dimension {size} exceeds u32::MAX").into(),
+                })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    Ok(crate::graph::OperandDescriptor {
+        data_type: graph_descriptor.data_type,
+        shape,
+        pending_permutation: graph_descriptor.pending_permutation.clone(),
+    })
 }
 
 /// Host tensor storage for the CoreML backend (mirrors `OrtTensor`).
@@ -220,21 +243,34 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                         source: "MLGraph is not a CoreML model graph".into(),
                     })?;
 
+            let runtime_descriptors = graph
+                .input_descriptors
+                .iter()
+                .map(|(name, graph_descriptor)| {
+                    let tensor =
+                        inputs
+                            .get(name.as_str())
+                            .ok_or_else(|| Error::GraphDispatchError {
+                                source: format!("missing input '{name}' for CoreML dispatch")
+                                    .into(),
+                            })?;
+                    Ok((
+                        name.clone(),
+                        runtime_input_descriptor(graph_descriptor, tensor)?,
+                    ))
+                })
+                .collect::<crate::error::Result<HashMap<_, _>>>()?;
+
             let mut byte_inputs: HashMap<String, CoremlByteInput> =
                 HashMap::with_capacity(graph.input_descriptors.len());
-            for (name, descriptor) in graph.input_descriptors.iter() {
+            for (name, descriptor) in &runtime_descriptors {
                 let tensor =
                     inputs
                         .get(name.as_str())
                         .ok_or_else(|| Error::GraphDispatchError {
                             source: format!("missing input '{name}' for CoreML dispatch").into(),
                         })?;
-                let logical =
-                    descriptor
-                        .byte_length()
-                        .ok_or_else(|| Error::GraphDispatchError {
-                            source: format!("input '{name}': cannot compute byte length").into(),
-                        })?;
+                let logical = tensor.rustnn_required_bytes();
                 let full = &self.tensors[tensor.id].memory;
                 let bytes = full
                     .get(..logical)
@@ -365,12 +401,20 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
+    use crate::GraphInfo;
+    use crate::backend_selection::DeviceType;
+    use crate::graph::{
+        DataType, Dimension, DynamicDimension, Operand, OperandDescriptor, OperandKind,
+    };
     use crate::mlcontext::{
-        Backend, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors, MLOperandDescriptor,
-        MLPowerPreference, MLTensorDescriptor,
+        Backend, MLBackendContext, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors,
+        MLOperandDescriptor, MLPowerPreference, MLTensor, MLTensorDescriptor,
     };
     use crate::mlgraphbuilder::MLGraphBuilder;
     use crate::operator_enums::MLOperandDataType;
+    use crate::operators::Operation;
 
     /// Build a context backed by CoreML. Returns `None` (test skipped) if no
     /// accelerated backend is available on this machine.
@@ -384,6 +428,103 @@ mod test {
             Err(crate::error::Error::NoBackendAvailableForBackendHint { .. }) => None,
             Err(e) => panic!("unexpected context creation error: {e:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_descriptor_uses_active_tensor_shape() {
+        let graph_descriptor = OperandDescriptor {
+            data_type: DataType::Float32,
+            shape: vec![
+                Dimension::Dynamic(DynamicDimension {
+                    name: "batch".to_string(),
+                    max_size: 8,
+                }),
+                Dimension::Static(3),
+                Dimension::Dynamic(DynamicDimension {
+                    name: "past_sequence_length".to_string(),
+                    max_size: 4096,
+                }),
+                Dimension::Static(64),
+            ],
+            pending_permutation: vec![],
+        };
+        let tensor = MLTensor {
+            id: 0,
+            constant: false,
+            descriptor: MLTensorDescriptor::new(MLOperandDataType::Float32, vec![1, 3, 0, 64]),
+        };
+
+        let runtime = super::runtime_input_descriptor(&graph_descriptor, &tensor).unwrap();
+        assert_eq!(
+            runtime.shape,
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(3),
+                Dimension::Static(0),
+                Dimension::Static(64),
+            ]
+        );
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_dynamic_relu_uses_active_shape_and_values() {
+        let dynamic_shape = vec![Dimension::Dynamic(DynamicDimension {
+            name: "elements".to_string(),
+            max_size: 4,
+        })];
+        let graph_info = GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: dynamic_shape.clone(),
+                        pending_permutation: vec![],
+                    },
+                    name: Some("input".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: dynamic_shape,
+                        pending_permutation: vec![],
+                    },
+                    name: Some("output".to_string()),
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Relu {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let mut context =
+            super::CoremlContext::new_from_device_type(DeviceType::Gpu, None).unwrap();
+        let mut graph = context.create_builder().unwrap().build(graph_info).unwrap();
+        let descriptor = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![2]);
+        let input = context.create_tensor(&descriptor).unwrap();
+        let output = context.create_tensor(&descriptor).unwrap();
+        context
+            .write_tensor(&input, bytemuck::cast_slice(&[-2.0f32, 3.5]))
+            .unwrap();
+
+        let inputs = MLNamedTensors::from([("input", &input)]);
+        let outputs = MLNamedTensors::from([("output", &output)]);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+
+        let mut result = [0.0f32; 2];
+        context
+            .read_tensor(&output, bytemuck::cast_slice_mut(&mut result))
+            .unwrap();
+        assert_eq!(result, [0.0, 3.5]);
     }
 
     #[test]
