@@ -789,6 +789,25 @@ webnn_graph "sample_graph" v1 {
         );
     }
 
+    #[test]
+    fn test_dispatch_allows_same_name_for_distinct_input_and_output_tensors() {
+        let descriptor = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![2, 2]);
+        let input_tensor = MLTensor {
+            id: 7,
+            constant: false,
+            descriptor: descriptor.clone(),
+        };
+        let output_tensor = MLTensor {
+            id: 8,
+            constant: false,
+            descriptor,
+        };
+        let inputs = MLNamedTensors::from([("value", &input_tensor)]);
+        let outputs = MLNamedTensors::from([("value", &output_tensor)]);
+
+        validate_unique_tensor_bindings(&inputs, &outputs).unwrap();
+    }
+
     #[cfg(feature = "trtx-runtime")]
     #[test]
     fn test_trtx_cuda_graph_replay() {
