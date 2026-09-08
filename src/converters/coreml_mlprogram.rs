@@ -192,6 +192,7 @@ mod mil_ops {
 
     // Shape operations
     pub const RESHAPE: &str = "reshape";
+    pub const SHAPE: &str = "shape";
 
     // Tensor manipulation operations
     pub const TRANSPOSE: &str = "transpose";
@@ -1407,6 +1408,7 @@ impl CoremlMlProgramConverter {
 
             // Shape operations
             "reshape" => mil_ops::RESHAPE,
+            "shape" => mil_ops::SHAPE,
 
             // Tensor manipulation
             "transpose" => mil_ops::TRANSPOSE,
@@ -4089,6 +4091,7 @@ impl CoremlMlProgramConverter {
             | Operation::LogicalNot { .. }
             | Operation::Softplus { .. }
             | Operation::Softsign { .. }
+            | Operation::Shape { .. }
                 if !input_names.is_empty() => {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
@@ -8137,46 +8140,41 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
             // `where` (MIL: select) — CoreML requires the condition to be bool,
             // but WebNN encodes booleans as uint8. Insert a cast when needed.
-            if op_type_lower == "where" {
-                if let Operation::Where { condition, .. } = op {
-                    let cond_id = *condition;
-                    let cond_operand = graph_info.operand(cond_id).ok_or_else(|| {
-                        GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!("where condition operand {cond_id} not found"),
-                        }
+            if op_type_lower == "where"
+                && let Operation::Where { condition, .. } = op
+            {
+                let cond_id = *condition;
+                graph_info
+                    .operand(cond_id)
+                    .ok_or_else(|| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".to_string(),
+                        reason: format!("where condition operand {cond_id} not found"),
                     })?;
-                    if cond_operand.descriptor.data_type == DataType::Uint8 {
-                        let cond_name = Self::output_name_for_operand(
-                            graph_info,
-                            cond_id,
-                            &operand_name_overrides,
-                        );
-                        // Suffix with this op's output id: a bare `{cond}_bool`
-                        // collides with the producing comparison's own
-                        // `{output}_bool` raw result ("Block redefines I/O name").
-                        let where_out = op.output_operand().unwrap_or(cond_id);
-                        let bool_cond_name = format!("{cond_name}_bool_{where_out}");
-                        let bool_cond_type = Self::create_value_with_mil_type(
-                            graph_info,
-                            cond_id,
-                            bool_cond_name.clone(),
-                            crate::protos::coreml::mil_spec::DataType::Bool as i32,
-                        )?;
-                        main_block.operations.push(Self::create_cast_operation(
-                            cond_name,
-                            bool_cond_type,
-                            "bool",
-                        ));
+                let cond_name =
+                    Self::output_name_for_operand(graph_info, cond_id, &operand_name_overrides);
+                // WebNN exposes logical tensors as uint8, while imported interchange
+                // graphs may also carry integer masks. MIL select requires bool for both.
+                // Suffix with this op's output id so this cast cannot redefine a
+                // comparison's raw `{output}_bool` value.
+                let where_out = op.output_operand().unwrap_or(cond_id);
+                let bool_cond_name = format!("{cond_name}_bool_{where_out}");
+                let bool_cond_type = Self::create_value_with_mil_type(
+                    graph_info,
+                    cond_id,
+                    bool_cond_name.clone(),
+                    crate::protos::coreml::mil_spec::DataType::Bool as i32,
+                )?;
+                main_block.operations.push(Self::create_cast_operation(
+                    cond_name,
+                    bool_cond_type,
+                    "bool",
+                ));
 
-                        let mut overrides = operand_name_overrides.clone();
-                        overrides.insert(cond_id, bool_cond_name);
-                        let mil_op =
-                            self.convert_operation_with_overrides(graph_info, op, &overrides)?;
-                        main_block.operations.push(mil_op);
-                        continue;
-                    }
-                }
+                let mut overrides = operand_name_overrides.clone();
+                overrides.insert(cond_id, bool_cond_name);
+                let mil_op = self.convert_operation_with_overrides(graph_info, op, &overrides)?;
+                main_block.operations.push(mil_op);
+                continue;
             }
 
             // Special handling for resample2d: lower to CoreML upsample ops.
@@ -10452,6 +10450,46 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn test_shape_lowers_to_mil_shape() {
+        let graph = GraphInfo {
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[2, 3, 4]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("shape".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Int64,
+                        shape: s(&[3]),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![op_from_operator_options(
+                "shape",
+                vec![0],
+                Some(1),
+                vec![],
+                OperatorOptions::default(),
+            )],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        assert_eq!(main_operation_types(&graph), vec![mil_ops::SHAPE]);
+    }
+
     fn reduce_log_sum_exp_graph(
         input_shape: &[u32],
         output_shape: &[u32],
@@ -11191,6 +11229,99 @@ mod tests {
             .get("CoreML7")
             .expect("CoreML7 block")
             .clone()
+    }
+
+    #[test]
+    fn test_where_integer_condition_uses_unique_bool_value() {
+        let graph = GraphInfo {
+            input_operands: vec![1, 2],
+            output_operands: vec![3],
+            operands: vec![
+                Operand {
+                    name: Some("condition".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Int64,
+                        shape: s(&[2]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("when_true".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[2]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("when_false".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[2]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("result".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[2]),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![op_from_operator_options(
+                "where",
+                vec![0, 1, 2],
+                Some(3),
+                vec![],
+                OperatorOptions::default(),
+            )],
+            constant_operand_ids_to_handles: HashMap::from([(
+                0,
+                ConstantData {
+                    data: [0_i64, 1_i64]
+                        .into_iter()
+                        .flat_map(i64::to_le_bytes)
+                        .collect(),
+                    label: None,
+                },
+            )]),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("CoreML where conversion should succeed");
+        let block = decode_main_block(&converted.data);
+        let mut output_names = std::collections::HashSet::new();
+        for output in block.operations.iter().flat_map(|op| &op.outputs) {
+            assert!(
+                output_names.insert(output.name.clone()),
+                "MIL output name redefined: {}",
+                output.name
+            );
+        }
+
+        let select = block
+            .operations
+            .iter()
+            .find(|op| op.r#type == mil_ops::WHERE)
+            .expect("select operation");
+        let Some(Binding::Name(condition_name)) = select
+            .inputs
+            .get("cond")
+            .and_then(|arg| arg.arguments.first())
+            .and_then(|binding| binding.binding.as_ref())
+        else {
+            panic!("select condition should be a named bool value");
+        };
+        assert_eq!(condition_name, "condition_bool_3");
     }
 
     /// Unpack a scalar immediate int argument (e.g. the `axis` input of a
