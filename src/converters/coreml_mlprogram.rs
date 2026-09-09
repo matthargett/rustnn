@@ -1914,6 +1914,370 @@ impl CoremlMlProgramConverter {
         out_name
     }
 
+    fn parse_dynamic_dim_expr(dim_name: &str) -> (String, i32) {
+        let name = dim_name.trim();
+        if let Some((base, offset)) = name.rsplit_once('+')
+            && let Ok(offset) = offset.trim().parse::<i32>()
+        {
+            return (base.trim().to_string(), offset);
+        }
+        if let Some((base, offset)) = name.rsplit_once('-')
+            && let Ok(offset) = offset.trim().parse::<i32>()
+        {
+            return (base.trim().to_string(), -offset);
+        }
+        (name.to_string(), 0)
+    }
+
+    fn resolve_dynamic_dim_source(
+        graph: &GraphInfo,
+        op: &Operation,
+        dim_name: &str,
+    ) -> Option<(u32, usize)> {
+        if dim_name.is_empty() {
+            return None;
+        }
+        for operand_id in op
+            .input_operands()
+            .iter()
+            .copied()
+            .chain(graph.input_operands.iter().copied())
+        {
+            let Some(operand) = graph.operand(operand_id) else {
+                continue;
+            };
+            if let Some(axis) = operand.descriptor.shape.iter().position(
+                |dimension| matches!(dimension, GraphDimension::Dynamic(dynamic) if dynamic.name == dim_name),
+            ) {
+                return Some((operand_id, axis));
+            }
+        }
+        None
+    }
+
+    fn emit_runtime_operand_shape(
+        block: &mut Block,
+        operand_name: &str,
+        rank: usize,
+        output_name: String,
+    ) -> String {
+        let int32 = crate::protos::coreml::mil_spec::DataType::Int32 as i32;
+        let output_type =
+            Self::value_type_for_static_shape(output_name.clone(), int32, &[rank as u32]);
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "x".to_string(),
+            Self::create_name_argument(operand_name.to_string()),
+        );
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::SHAPE,
+            inputs,
+            vec![output_type],
+        ));
+        output_name
+    }
+
+    fn emit_runtime_dimension_vector(
+        block: &mut Block,
+        graph: &GraphInfo,
+        op: &Operation,
+        operand_name_overrides: &HashMap<u32, String>,
+        target_shape: &[MLDimension],
+        prefix: &str,
+        allow_inferred_dimension: bool,
+    ) -> Result<String, GraphError> {
+        let int32 = crate::protos::coreml::mil_spec::DataType::Int32 as i32;
+        let mut shape_names = HashMap::<u32, String>::new();
+        let mut components = Vec::with_capacity(target_shape.len());
+        let mut inferred_dimension_used = false;
+
+        for (target_axis, dimension) in target_shape.iter().enumerate() {
+            let component_name = format!("{prefix}_dim_{target_axis}");
+            match dimension {
+                MLDimension::Static(size) => components.push(Self::emit_int32_const(
+                    block,
+                    &[*size as i32],
+                    &[1],
+                    component_name,
+                )),
+                MLDimension::Dynamic(dynamic) => {
+                    let exact_source = Self::resolve_dynamic_dim_source(graph, op, &dynamic.name);
+                    let (source, offset) = if let Some(source) = exact_source {
+                        (Some(source), 0)
+                    } else {
+                        let (base_name, offset) = Self::parse_dynamic_dim_expr(&dynamic.name);
+                        (
+                            Self::resolve_dynamic_dim_source(graph, op, &base_name),
+                            offset,
+                        )
+                    };
+
+                    let Some((source_id, source_axis)) = source else {
+                        if allow_inferred_dimension && !inferred_dimension_used {
+                            inferred_dimension_used = true;
+                            components.push(Self::emit_int32_const(
+                                block,
+                                &[-1],
+                                &[1],
+                                component_name,
+                            ));
+                            continue;
+                        }
+                        return Err(GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!(
+                                "cannot resolve runtime source for dynamic dimension {:?}",
+                                dynamic.name
+                            ),
+                        });
+                    };
+                    let source_operand =
+                        graph
+                            .operand(source_id)
+                            .ok_or_else(|| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("shape source operand {source_id} not found"),
+                            })?;
+                    let source_shape_name = if let Some(name) = shape_names.get(&source_id) {
+                        name.clone()
+                    } else {
+                        let source_name =
+                            Self::output_name_for_operand(graph, source_id, operand_name_overrides);
+                        let shape_name = Self::emit_runtime_operand_shape(
+                            block,
+                            &source_name,
+                            source_operand.descriptor.shape.len(),
+                            format!("{prefix}_source_{source_id}_shape"),
+                        );
+                        shape_names.insert(source_id, shape_name.clone());
+                        shape_name
+                    };
+                    let value_name = Self::rnn_slice(
+                        block,
+                        &source_shape_name,
+                        &[source_axis as u32],
+                        &[1],
+                        component_name,
+                        int32,
+                    );
+                    if offset == 0 {
+                        components.push(value_name);
+                    } else {
+                        let offset_name = Self::emit_int32_const(
+                            block,
+                            &[offset],
+                            &[1],
+                            format!("{prefix}_dim_{target_axis}_offset"),
+                        );
+                        components.push(Self::rnn_binary(
+                            block,
+                            mil_ops::ADD,
+                            &value_name,
+                            &offset_name,
+                            format!("{prefix}_dim_{target_axis}_adjusted"),
+                            int32,
+                            &[1],
+                        ));
+                    }
+                }
+            }
+        }
+
+        if components.len() == 1 {
+            return Ok(components.pop().expect("one runtime shape component"));
+        }
+        Ok(Self::rnn_concat(
+            block,
+            &components,
+            0,
+            format!("{prefix}_shape"),
+            int32,
+            &[target_shape.len() as u32],
+        ))
+    }
+
+    fn emit_dynamic_expand(
+        block: &mut Block,
+        graph: &GraphInfo,
+        op: &Operation,
+        operand_name_overrides: &HashMap<u32, String>,
+    ) -> Result<(), GraphError> {
+        let Operation::Expand {
+            input, new_shape, ..
+        } = op
+        else {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "dynamic expand helper received another operation".to_string(),
+            });
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "expand has no output operand".to_string(),
+            })?;
+        let input_operand = graph
+            .operand(*input)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("expand input operand {input} not found"),
+            })?;
+        let output_operand =
+            graph
+                .operand(output_id)
+                .ok_or_else(|| GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("expand output operand {output_id} not found"),
+                })?;
+        let input_rank = input_operand.descriptor.shape.len();
+        let output_rank = new_shape.len();
+        if input_rank > output_rank {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("expand input rank {input_rank} exceeds output rank {output_rank}"),
+            });
+        }
+
+        let (output_name, output_type) =
+            Self::create_output_value(graph, output_id, operand_name_overrides)?;
+        let int32 = crate::protos::coreml::mil_spec::DataType::Int32 as i32;
+        let needs_int_proxy = matches!(
+            input_operand.descriptor.data_type,
+            DataType::Int8 | DataType::Uint8
+        );
+        let tile_dtype = if needs_int_proxy {
+            int32
+        } else {
+            Self::graph_value_mil_type(&input_operand.descriptor.data_type)?
+        };
+        let source_name = Self::output_name_for_operand(graph, *input, operand_name_overrides);
+        let mut tile_input_name = if needs_int_proxy {
+            let cast_name = format!("{output_name}_expand_int_in");
+            let cast_type = Self::create_named_value_type(
+                cast_name.clone(),
+                int32,
+                &input_operand.descriptor.shape,
+                true,
+            );
+            block
+                .operations
+                .push(Self::create_cast_operation(source_name, cast_type, "int32"));
+            cast_name
+        } else {
+            source_name
+        };
+
+        let input_shape_name = Self::emit_runtime_operand_shape(
+            block,
+            &tile_input_name,
+            input_rank,
+            format!("{output_name}_expand_input_shape"),
+        );
+        let padded_shape_name = if input_rank < output_rank {
+            let padding = output_rank - input_rank;
+            let ones = Self::emit_int32_const(
+                block,
+                &vec![1; padding],
+                &[padding as u32],
+                format!("{output_name}_expand_leading_ones"),
+            );
+            let shape_name = if input_rank == 0 {
+                ones
+            } else {
+                Self::rnn_concat(
+                    block,
+                    &[ones, input_shape_name],
+                    0,
+                    format!("{output_name}_expand_padded_shape"),
+                    int32,
+                    &[output_rank as u32],
+                )
+            };
+            let padded_name = format!("{output_name}_expand_reshaped");
+            let padded_dimensions = std::iter::repeat_n(GraphDimension::Static(1), padding)
+                .chain(input_operand.descriptor.shape.iter().cloned())
+                .collect::<Vec<_>>();
+            let padded_type = Self::create_named_value_type(
+                padded_name.clone(),
+                tile_dtype,
+                &padded_dimensions,
+                false,
+            );
+            let mut reshape_inputs = HashMap::new();
+            reshape_inputs.insert("x".to_string(), Self::create_name_argument(tile_input_name));
+            reshape_inputs.insert(
+                "shape".to_string(),
+                Self::create_name_argument(shape_name.clone()),
+            );
+            block.operations.push(Self::create_mil_operation(
+                mil_ops::RESHAPE,
+                reshape_inputs,
+                vec![padded_type],
+            ));
+            tile_input_name = padded_name;
+            shape_name
+        } else {
+            input_shape_name
+        };
+
+        let target_shape_name = Self::emit_runtime_dimension_vector(
+            block,
+            graph,
+            op,
+            operand_name_overrides,
+            new_shape,
+            &format!("{output_name}_expand_target"),
+            false,
+        )?;
+        let reps_name = format!("{output_name}_expand_reps");
+        let reps_type =
+            Self::value_type_for_static_shape(reps_name.clone(), int32, &[output_rank as u32]);
+        let mut reps_inputs = HashMap::new();
+        reps_inputs.insert(
+            "x".to_string(),
+            Self::create_name_argument(target_shape_name),
+        );
+        reps_inputs.insert(
+            "y".to_string(),
+            Self::create_name_argument(padded_shape_name),
+        );
+        block.operations.push(Self::create_mil_operation(
+            "floor_div",
+            reps_inputs,
+            vec![reps_type],
+        ));
+
+        let tile_output_name = if needs_int_proxy {
+            format!("{output_name}_expand_int_out")
+        } else {
+            output_name.clone()
+        };
+        let tile_output_type = Self::create_named_value_type(
+            tile_output_name.clone(),
+            tile_dtype,
+            &output_operand.descriptor.shape,
+            false,
+        );
+        let mut tile_inputs = HashMap::new();
+        tile_inputs.insert("x".to_string(), Self::create_name_argument(tile_input_name));
+        tile_inputs.insert("reps".to_string(), Self::create_name_argument(reps_name));
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::TILE,
+            tile_inputs,
+            vec![tile_output_type],
+        ));
+
+        if needs_int_proxy {
+            block.operations.push(Self::create_cast_operation(
+                tile_output_name,
+                output_type,
+                Self::cast_dtype_string_for_graph_type(&input_operand.descriptor.data_type)?,
+            ));
+        }
+        Ok(())
+    }
+
     /// Emit a constant zero tensor of the given shape/dtype. Returns `out_name`.
     fn rnn_zeros(block: &mut Block, shape: &[u32], out_name: String, dtype: i32) -> String {
         use crate::protos::coreml::mil_spec::{TensorValue, Value, tensor_value, value};
@@ -6607,6 +6971,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             } = &op
                 && !op.input_operands().is_empty()
                 && !expand_shape.is_empty()
+                && !expand_shape
+                    .iter()
+                    .any(|dimension| matches!(dimension, MLDimension::Dynamic(_)))
                 && let Some(input_operand) = graph_info.operand(op.input_operands()[0])
             {
                 let new_shape_u32: Vec<u32> = expand_shape
@@ -7975,6 +8342,20 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     mul_in,
                     vec![out_type],
                 ));
+                continue;
+            }
+
+            if let Operation::Expand { new_shape, .. } = op
+                && new_shape
+                    .iter()
+                    .any(|dimension| matches!(dimension, MLDimension::Dynamic(_)))
+            {
+                Self::emit_dynamic_expand(
+                    &mut main_block,
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                )?;
                 continue;
             }
 
@@ -10231,6 +10612,48 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
+            if let Operation::Reshape {
+                input, new_shape, ..
+            } = op
+                && new_shape
+                    .iter()
+                    .any(|dimension| matches!(dimension, MLDimension::Dynamic(_)))
+            {
+                let output_id =
+                    op.output_operand()
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: "reshape has no output operand".to_string(),
+                        })?;
+                let input_name =
+                    Self::output_name_for_operand(graph_info, *input, &operand_name_overrides);
+                let (output_name, output_type) =
+                    Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                let shape_name = Self::emit_runtime_dimension_vector(
+                    &mut main_block,
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    new_shape,
+                    &format!("{output_name}_reshape_target"),
+                    true,
+                )?;
+                let mut reshape_inputs = HashMap::new();
+                reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                reshape_inputs.insert("shape".to_string(), Self::create_name_argument(shape_name));
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::RESHAPE,
+                    reshape_inputs,
+                    vec![output_type],
+                ));
+                if let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+                continue;
+            }
+
             let mil_op =
                 self.convert_operation_with_overrides(graph_info, op, &operand_name_overrides)?;
             main_block.operations.push(mil_op);
@@ -11802,6 +12225,194 @@ mod tests {
                 Some(dimension::Dimension::Unknown(_))
             )));
         }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_dynamic_coreml_shape_expand_uses_runtime_repetitions() {
+        let batch = || {
+            crate::graph::Dimension::Dynamic(DynamicDimension {
+                name: "batch".to_string(),
+                max_size: 8,
+            })
+        };
+        let graph = GraphInfo {
+            input_operands: vec![0, 1],
+            output_operands: vec![2],
+            operands: vec![
+                Operand {
+                    name: Some("shape_source".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![batch()],
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("value".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[1, 4]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("result".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![batch(), crate::graph::Dimension::Static(4)],
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![Operation::Expand {
+                input: 1,
+                new_shape: vec![
+                    MLDimension::Dynamic(crate::operator_options::MLDynamicDimension {
+                        name: "batch".to_string(),
+                        max_size: 8,
+                    }),
+                    MLDimension::Static(4),
+                ],
+                options: None,
+                outputs: vec![2],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("dynamic expand should convert");
+        let block = decode_main_block(&converted.data);
+        let tile = block
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.r#type == mil_ops::TILE
+                    && operation
+                        .outputs
+                        .iter()
+                        .any(|output| output.name == "result")
+            })
+            .expect("dynamic expand tile");
+        let Some(Binding::Name(reps_name)) = tile
+            .inputs
+            .get("reps")
+            .and_then(|argument| argument.arguments.first())
+            .and_then(|binding| binding.binding.as_ref())
+        else {
+            panic!("dynamic expand repetitions must be a named runtime value");
+        };
+        assert_eq!(reps_name, "result_expand_reps");
+        assert!(block.operations.iter().any(|operation| {
+            operation.r#type == "floor_div"
+                && operation
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == *reps_name)
+        }));
+        assert!(block.operations.iter().any(|operation| {
+            operation.r#type == mil_ops::SHAPE
+                && matches!(
+                    operation
+                        .inputs
+                        .get("x")
+                        .and_then(|argument| argument.arguments.first())
+                        .and_then(|binding| binding.binding.as_ref()),
+                    Some(Binding::Name(name)) if name == "shape_source"
+                )
+        }));
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_dynamic_coreml_shape_reshape_uses_runtime_shape() {
+        let dynamic = |name: &str, max_size| {
+            crate::graph::Dimension::Dynamic(DynamicDimension {
+                name: name.to_string(),
+                max_size,
+            })
+        };
+        let graph = GraphInfo {
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![dynamic("batch", 8), dynamic("sequence", 4096)]
+                            .into_iter()
+                            .chain(s(&[576]))
+                            .collect(),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("result".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![dynamic("batch", 8), dynamic("sequence", 4096)]
+                            .into_iter()
+                            .chain(s(&[9, 64]))
+                            .collect(),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![Operation::Reshape {
+                input: 0,
+                new_shape: vec![
+                    MLDimension::Dynamic(crate::operator_options::MLDynamicDimension {
+                        name: "batch".to_string(),
+                        max_size: 8,
+                    }),
+                    MLDimension::Dynamic(crate::operator_options::MLDynamicDimension {
+                        name: "sequence".to_string(),
+                        max_size: 4096,
+                    }),
+                    MLDimension::Static(9),
+                    MLDimension::Static(64),
+                ],
+                options: None,
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("dynamic reshape should convert");
+        let block = decode_main_block(&converted.data);
+        let reshape = block
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.r#type == mil_ops::RESHAPE
+                    && operation
+                        .outputs
+                        .iter()
+                        .any(|output| output.name == "result")
+            })
+            .expect("dynamic reshape");
+        let Some(Binding::Name(shape_name)) = reshape
+            .inputs
+            .get("shape")
+            .and_then(|argument| argument.arguments.first())
+            .and_then(|binding| binding.binding.as_ref())
+        else {
+            panic!("dynamic reshape shape must be a named runtime value");
+        };
+        assert_eq!(shape_name, "result_reshape_target_shape");
     }
 
     #[test]
