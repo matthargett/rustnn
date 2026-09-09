@@ -1691,6 +1691,42 @@ impl CoremlMlProgramConverter {
         out_name
     }
 
+    /// Emit an elementwise binary helper without replacing dynamic dimensions
+    /// with their maximum extents.
+    fn binary_with_graph_shape(
+        block: &mut Block,
+        mil_op: &str,
+        x: &str,
+        y: &str,
+        out_name: String,
+        dtype: i32,
+        shape: &[GraphDimension],
+    ) -> String {
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
+        inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
+        let ty = Self::create_named_value_type(out_name.clone(), dtype, shape, false);
+        block
+            .operations
+            .push(Self::create_mil_operation(mil_op, inputs, vec![ty]));
+        out_name
+    }
+
+    fn cast_with_graph_shape(
+        block: &mut Block,
+        x: &str,
+        out_name: String,
+        dtype: i32,
+        shape: &[GraphDimension],
+    ) -> String {
+        let ty = Self::create_named_value_type(out_name.clone(), dtype, shape, false);
+        let dtype_str = Self::cast_dtype_string_for_mil_type(dtype).unwrap_or("int32");
+        block
+            .operations
+            .push(Self::create_cast_operation(x.to_string(), ty, dtype_str));
+        out_name
+    }
+
     /// Emit an elementwise unary op `out = f(x)`. Returns `out_name`.
     fn rnn_unary(
         block: &mut Block,
@@ -1771,7 +1807,7 @@ impl CoremlMlProgramConverter {
     fn emit_gather_index_norm(
         block: &mut Block,
         idx_name: &str,
-        idx_shape: &[u32],
+        idx_shape: &[GraphDimension],
         sizes: &[u32],
         prefix: &str,
     ) -> String {
@@ -1790,7 +1826,7 @@ impl CoremlMlProgramConverter {
         let size_c = Self::emit_int32_const(block, &sizes_i32, cshape, p("gsz"));
         let sizem1_c = Self::emit_int32_const(block, &sizes_m1, cshape, p("gszm1"));
         let zero_c = Self::emit_int32_const(block, &[0], &[], p("gz"));
-        let is_neg = Self::rnn_binary(
+        let is_neg = Self::binary_with_graph_shape(
             block,
             mil_ops::LESS,
             idx_name,
@@ -1799,8 +1835,8 @@ impl CoremlMlProgramConverter {
             bool_t,
             idx_shape,
         );
-        let is_neg_i = Self::rnn_unary_cast(block, &is_neg, p("gnegi"), int32, idx_shape);
-        let offset = Self::rnn_binary(
+        let is_neg_i = Self::cast_with_graph_shape(block, &is_neg, p("gnegi"), int32, idx_shape);
+        let offset = Self::binary_with_graph_shape(
             block,
             mil_ops::MUL,
             &is_neg_i,
@@ -1809,7 +1845,7 @@ impl CoremlMlProgramConverter {
             int32,
             idx_shape,
         );
-        let wrapped = Self::rnn_binary(
+        let wrapped = Self::binary_with_graph_shape(
             block,
             mil_ops::ADD,
             idx_name,
@@ -1818,7 +1854,7 @@ impl CoremlMlProgramConverter {
             int32,
             idx_shape,
         );
-        let mx = Self::rnn_binary(
+        let mx = Self::binary_with_graph_shape(
             block,
             mil_ops::MAXIMUM,
             &wrapped,
@@ -1827,7 +1863,7 @@ impl CoremlMlProgramConverter {
             int32,
             idx_shape,
         );
-        Self::rnn_binary(
+        Self::binary_with_graph_shape(
             block,
             mil_ops::MINIMUM,
             &mx,
@@ -1836,24 +1872,6 @@ impl CoremlMlProgramConverter {
             int32,
             idx_shape,
         )
-    }
-
-    /// Emit a `cast(x, dtype)` producing `out_name` with the given shape/dtype.
-    fn rnn_unary_cast(
-        block: &mut Block,
-        x: &str,
-        out_name: String,
-        dtype: i32,
-        shape: &[u32],
-    ) -> String {
-        let out_type = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
-        let dtype_str = Self::cast_dtype_string_for_mil_type(dtype).unwrap_or("int32");
-        block.operations.push(Self::create_cast_operation(
-            x.to_string(),
-            out_type,
-            dtype_str,
-        ));
-        out_name
     }
 
     /// Emit `reshape(x, shape)`. Returns `out_name`.
@@ -9025,7 +9043,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         .unwrap_or_default();
                     let idx_shape = graph_info
                         .operand(idx_id)
-                        .map(|o| o.descriptor.static_or_max_shape())
+                        .map(|o| o.descriptor.shape.clone())
                         .unwrap_or_default();
                     let axis_size = data_shape.get(axis as usize).copied().unwrap_or(1);
 
@@ -9095,11 +9113,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         .unwrap_or_default();
                     let idx_shape = graph_info
                         .operand(idx_id)
-                        .map(|o| o.descriptor.static_or_max_shape())
+                        .map(|o| o.descriptor.shape.clone())
                         .unwrap_or_default();
                     // CoreML gather_nd crashes on rank-5+ data; leave those to the
                     // (guarded) generic path which reports the limitation.
-                    let k = idx_shape.last().copied().unwrap_or(0) as usize;
+                    let k = idx_shape
+                        .last()
+                        .map(crate::graph::get_static_or_max_size)
+                        .unwrap_or(0) as usize;
                     if data_shape.len() <= 4 && k >= 1 && k <= data_shape.len() {
                         let sizes: Vec<u32> = data_shape[..k].to_vec();
                         let (output_name, output_type) = Self::create_output_value(
@@ -11684,6 +11705,103 @@ mod tests {
         assert_eq!(shape_range.size_ranges[0].upper_bound, 8);
         assert_eq!(shape_range.size_ranges[1].lower_bound, 4);
         assert_eq!(shape_range.size_ranges[1].upper_bound, 4);
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_dynamic_gather_normalization_preserves_index_dimensions() {
+        let dynamic = |name: &str, max_size| {
+            crate::graph::Dimension::Dynamic(DynamicDimension {
+                name: name.to_string(),
+                max_size,
+            })
+        };
+        let index_shape = vec![dynamic("batch", 8), dynamic("sequence", 4096)];
+        let graph = GraphInfo {
+            input_operands: vec![0, 1],
+            output_operands: vec![2],
+            operands: vec![
+                Operand {
+                    name: Some("table".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[32, 4]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("indices".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Int64,
+                        shape: index_shape.clone(),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("result".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![dynamic("batch", 8), dynamic("sequence", 4096)]
+                            .into_iter()
+                            .chain(s(&[4]))
+                            .collect(),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![op_from_operator_options(
+                "gather",
+                vec![0, 1],
+                Some(2),
+                vec![],
+                OperatorOptions::from_json_with_op_type(
+                    "gather",
+                    &serde_json::json!({ "axis": 0 }),
+                )
+                .expect("gather options"),
+            )],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("dynamic gather should convert");
+        let block = decode_main_block(&converted.data);
+
+        for output_name in [
+            "result_gneg",
+            "result_gnegi",
+            "result_goff",
+            "result_gwrap",
+            "result_gmx",
+            "result_gcl",
+        ] {
+            let output = block
+                .operations
+                .iter()
+                .flat_map(|operation| &operation.outputs)
+                .find(|output| output.name == output_name)
+                .unwrap_or_else(|| panic!("missing normalization output {output_name}"));
+            let tensor = match output
+                .r#type
+                .as_ref()
+                .and_then(|value| value.r#type.as_ref())
+                .expect("normalization output type")
+            {
+                crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor) => tensor,
+                _ => panic!("expected tensor output for {output_name}"),
+            };
+            assert_eq!(tensor.dimensions.len(), index_shape.len());
+            assert!(tensor.dimensions.iter().all(|dimension| matches!(
+                dimension.dimension,
+                Some(dimension::Dimension::Unknown(_))
+            )));
+        }
     }
 
     #[test]
